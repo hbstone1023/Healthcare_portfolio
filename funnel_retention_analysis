@@ -1,0 +1,321 @@
+# Women's Health Funnel & Retention Analysis
+
+Analyzing patient conversion and retention for a digital women's health platform (synthetic data, modeled after companies like Maven and Allara).
+
+The big question: where do patients drop off, and which segments are most at risk?
+
+**TL;DR:** Endometriosis patients convert to a first visit at ~37%, vs. 60-70% for every other diagnosis. The drop happens at the provider-match step, which points to a supply problem (not enough endo specialists) rather than patient engagement. More on this in section 5.
+
+---
+
+## 1. Setup
+import pandas as pd
+import numpy as np
+import duckdb
+import seaborn as sns
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+# suppress the future warnings that pandas keeps throwing
+import warnings
+warnings.filterwarnings('ignore')
+
+# styling
+sns.set_theme(style='whitegrid', context='talk')
+
+# tweaks I picked up from a Storytelling with Data thing
+plt.rcParams['figure.dpi'] = 110
+plt.rcParams['axes.spines.top'] = False
+plt.rcParams['axes.spines.right'] = False
+plt.rcParams['axes.titleweight'] = 'bold'
+plt.rcParams['axes.titlepad'] = 14
+
+# muted palette - the default seaborn one is too bright for healthcare imo
+palette = ['#2E5E8E', '#5BA3C7', '#88C7B8', '#F4B860', '#D17B5C']
+sns.set_palette(palette)
+
+# load the data into duckdb so I can run the .sql files directly against the csvs
+# (way easier than spinning up postgres for a portfolio project)
+ROOT = Path('..').resolve()
+
+con = duckdb.connect()
+con.execute(f"CREATE TABLE patients AS SELECT * FROM read_csv_auto('{ROOT}/data/patients.csv')")
+con.execute(f"CREATE TABLE events AS SELECT * FROM read_csv_auto('{ROOT}/data/events.csv')")
+
+# helper - just makes the cells below cleaner
+def run_sql_file(filename):
+    return con.execute((ROOT / 'sql' / filename).read_text()).fetchdf()
+
+n_patients = con.execute('SELECT COUNT(*) FROM patients').fetchone()[0]
+n_events = con.execute('SELECT COUNT(*) FROM events').fetchone()[0]
+print(f'patients: {n_patients:,}')
+print(f'events:   {n_events:,}')
+
+Quick peek at the schema:
+con.execute('SELECT * FROM patients LIMIT 5').fetchdf()
+
+con.execute('SELECT * FROM events ORDER BY patient_id, event_date LIMIT 8').fetchdf()
+
+## 2. Funnel analysis
+
+Patient journey is:
+
+`Account Created → Intake Completed → Provider Matched → First Visit`
+
+The SQL pivots the long event table into binary flags per patient (`MAX(CASE WHEN...)`) which I find easier to reason about than self-joins. Then I aggregate to get conversion rates per step, segmented by diagnosis.
+funnel_df = run_sql_file('01_funnel_analysis.sql')
+funnel_df
+
+### Overall funnel
+# aggregate across diagnoses
+funnel_overall = pd.DataFrame({
+    'step': ['Account\nCreated', 'Intake\nCompleted', 'Provider\nMatched', 'First\nVisit'],
+    'patients': [
+        funnel_df['total_acct_created'].sum(),
+        funnel_df['total_intake_completed'].sum(),
+        funnel_df['total_provider_matched'].sum(),
+        funnel_df['total_first_visit'].sum(),
+    ]
+})
+funnel_overall['pct'] = funnel_overall['patients'] / funnel_overall['patients'].iloc[0] * 100
+funnel_overall
+
+fig, ax = plt.subplots(figsize=(11, 5.5))
+
+bars = ax.bar(funnel_overall['step'], funnel_overall['patients'], color=palette[0], width=0.6)
+
+# label each bar
+for bar, pct in zip(bars, funnel_overall['pct']):
+    h = bar.get_height()
+    ax.text(bar.get_x() + bar.get_width()/2, h + 80,
+            f'{int(h):,}\n({pct:.1f}%)',
+            ha='center', va='bottom', fontsize=11, fontweight='semibold')
+
+# show the drop between each step
+for i in range(len(funnel_overall) - 1):
+    drop = funnel_overall['patients'].iloc[i] - funnel_overall['patients'].iloc[i+1]
+    midpoint_y = (funnel_overall['patients'].iloc[i] + funnel_overall['patients'].iloc[i+1]) / 2
+    ax.annotate(
+        f'-{drop:,}',
+        xy=(i + 0.5, midpoint_y),
+        ha='center', va='center', fontsize=10, color='#B23A48', fontweight='bold',
+        bbox=dict(boxstyle='round,pad=0.3', fc='white', ec='#B23A48', lw=0.8)
+    )
+
+ax.set_ylabel('Patients')
+ax.set_title('Patient acquisition funnel (overall)')
+ax.set_ylim(0, funnel_overall['patients'].max() * 1.15)
+ax.set_yticks([])
+ax.spines['left'].set_visible(False)
+
+plt.tight_layout()
+plt.savefig(ROOT / 'images' / '01_overall_funnel.png', bbox_inches='tight')
+plt.show()
+
+About 40% of signups never make it to a first visit. The biggest single drop is Match → First Visit (740 patients), which makes sense — that's where calendar logistics and insurance verification live.
+### Funnel by diagnosis
+
+This is where it gets interesting.
+# reshape for grouped bar chart
+plot_df = funnel_df.melt(
+    id_vars='primary_diagnosis',
+    value_vars=['pct_acct_to_intake', 'pct_intake_to_match', 'pct_match_to_visit'],
+    var_name='step',
+    value_name='conversion_pct'
+)
+
+# rename for readable labels
+step_labels = {
+    'pct_acct_to_intake': 'Account → Intake',
+    'pct_intake_to_match': 'Intake → Match',
+    'pct_match_to_visit': 'Match → First Visit',
+}
+plot_df['step'] = plot_df['step'].map(step_labels)
+
+fig, ax = plt.subplots(figsize=(12, 6))
+sns.barplot(
+    data=plot_df, x='step', y='conversion_pct',
+    hue='primary_diagnosis', ax=ax, edgecolor='white', linewidth=0.5
+)
+
+ax.set_title('Step-to-step conversion by diagnosis')
+ax.set_xlabel('')
+ax.set_ylabel('Conversion rate (%)')
+ax.set_ylim(0, 105)
+ax.legend(title='Diagnosis', bbox_to_anchor=(1.02, 1), loc='upper left', frameon=False)
+
+# add labels on bars
+for container in ax.containers:
+    ax.bar_label(container, fmt='%.0f%%', padding=2, fontsize=9)
+
+plt.tight_layout()
+plt.savefig(ROOT / 'images' / '02_funnel_by_diagnosis.png', bbox_inches='tight')
+plt.show()
+
+# end-to-end conversion rate
+conv = funnel_df[['primary_diagnosis', 'overall_conversion_rate']].sort_values('overall_conversion_rate')
+
+fig, ax = plt.subplots(figsize=(10, 4.5))
+
+# highlight anything under 50% in red
+bar_colors = ['#B23A48' if x < 50 else palette[0] for x in conv['overall_conversion_rate']]
+bars = ax.barh(conv['primary_diagnosis'], conv['overall_conversion_rate'], color=bar_colors)
+
+for bar, val in zip(bars, conv['overall_conversion_rate']):
+    ax.text(val + 1, bar.get_y() + bar.get_height()/2, f'{val:.1f}%',
+            va='center', fontsize=11, fontweight='semibold')
+
+ax.set_xlim(0, 85)
+ax.set_xlabel('End-to-end conversion rate (%)')
+ax.set_title('Account → First Visit conversion, by diagnosis')
+
+# 50% reference line
+ax.axvline(50, color='#B23A48', linestyle='--', linewidth=1, alpha=0.5)
+ax.text(50.5, -0.4, '50%', color='#B23A48', fontsize=9, alpha=0.8)
+
+plt.tight_layout()
+plt.savefig(ROOT / 'images' / '03_overall_conversion_by_diagnosis.png', bbox_inches='tight')
+plt.show()
+
+So Endometriosis converts at ~37% end-to-end while everyone else is between 61-70%. Looking at the step-level chart above, the gap really opens up at Intake → Match — which strongly suggests it's a provider supply issue (not enough endo specialists on the platform) rather than patients losing interest.
+## 3. Cohort retention
+
+Once a patient sees a provider, do they come back? Cohort here = the month a patient joined.
+retention_df = run_sql_file('02_cohort_retention.sql')
+retention_df.head(8)
+
+# pivot to cohort x month-N matrix for the heatmap
+retention_matrix = retention_df.pivot(
+    index='cohort_month',
+    columns='months_retained',
+    values='retention_rate_pct'
+)
+
+# clean up labels
+retention_matrix.index = pd.to_datetime(retention_matrix.index).strftime('%Y-%m')
+retention_matrix.columns = [f'Month {c}' for c in retention_matrix.columns]
+
+retention_matrix
+
+fig, ax = plt.subplots(figsize=(9, 9))
+
+sns.heatmap(
+    retention_matrix,
+    annot=True, fmt='.1f',
+    cmap='YlGnBu',
+    cbar_kws={'label': 'Retention rate (%)'},
+    linewidths=0.5, linecolor='white',
+    ax=ax,
+    vmin=15, vmax=50,
+    annot_kws={'fontsize': 11, 'fontweight': 'semibold'}
+)
+
+ax.set_title('Cohort retention\n(% returning in month N)', pad=18)
+ax.set_xlabel('Months since join')
+ax.set_ylabel('Join cohort')
+
+plt.tight_layout()
+plt.savefig(ROOT / 'images' / '04_retention_heatmap.png', bbox_inches='tight')
+plt.show()
+
+### Retention curves
+fig, ax = plt.subplots(figsize=(11, 6))
+
+# one line per cohort
+cohort_colors = sns.color_palette('crest', n_colors=len(retention_matrix))
+
+for i, (cohort, row) in enumerate(retention_matrix.iterrows()):
+    ax.plot(row.index, row.values, marker='o', linewidth=2,
+            color=cohort_colors[i], label=cohort, alpha=0.85)
+
+# overlay average so it stands out from the noise
+avg = retention_matrix.mean(axis=0)
+ax.plot(avg.index, avg.values, marker='D', linewidth=3.5,
+        color='#B23A48', label='Average', zorder=10)
+
+ax.set_title('Retention curves by cohort')
+ax.set_xlabel('Months since join')
+ax.set_ylabel('Retention rate (%)')
+ax.legend(title='Cohort', bbox_to_anchor=(1.02, 1), loc='upper left',
+          frameon=False, ncol=1, fontsize=9)
+ax.set_ylim(0, retention_matrix.max().max() * 1.15)
+
+plt.tight_layout()
+plt.savefig(ROOT / 'images' / '05_retention_curves.png', bbox_inches='tight')
+plt.show()
+
+Curves are pretty flat across cohorts - retention isn't getting better or worse over time. About 42% return in month 1, ~30% in month 2, ~27% in month 3. The biggest drop is between the first visit and month 1, so that's where you'd want to put your retention investment.
+
+(Note: the Jan 2024 cohort doesn't have a month 3 datapoint yet because the data only goes through April 2024 + 90 days. Worth being explicit about.)
+## 4. Time to first visit
+
+For patients who DID convert, how long did it take? This is the kind of thing operations leadership always asks.
+ttv_df = run_sql_file('03_time_to_conversion.sql')
+ttv_df
+
+# get the raw distribution for a violin plot - SQL can't really do this
+# (well it can but it's ugly). Just easier to grab the row-level data.
+raw = con.execute('''
+    WITH journey AS (
+        SELECT
+            p.patient_id,
+            p.primary_diagnosis,
+            MIN(CASE WHEN e.event_name = '1_Account_Created' THEN e.event_date END) AS dt_acct,
+            MIN(CASE WHEN e.event_name = '4_First_Visit' THEN e.event_date END) AS dt_visit
+        FROM patients p
+        JOIN events e ON p.patient_id = e.patient_id
+        GROUP BY 1, 2
+    )
+    SELECT primary_diagnosis,
+           DATE_DIFF('day', dt_acct, dt_visit) AS days
+    FROM journey
+    WHERE dt_visit IS NOT NULL
+''').fetchdf()
+
+raw.head()
+
+# order by median descending so the violins read left-to-right by speed
+order = ttv_df.sort_values('median_days_to_visit', ascending=False)['primary_diagnosis'].tolist()
+
+fig, ax = plt.subplots(figsize=(11, 6))
+
+sns.violinplot(
+    data=raw, x='primary_diagnosis', y='days',
+    order=order, inner='quartile', cut=0,
+    ax=ax, palette=palette
+)
+
+ax.set_title('Days from account creation to first visit')
+ax.set_xlabel('Primary diagnosis')
+ax.set_ylabel('Days')
+
+plt.tight_layout()
+plt.savefig(ROOT / 'images' / '06_time_to_conversion.png', bbox_inches='tight')
+plt.show()
+
+Median is ~9-10 days across all diagnoses, with a long right tail out to ~3 weeks for the slowest 10%. So time-to-visit isn't really what separates converting from non-converting patients - what matters is whether they get matched at all. Reinforces the section 2 finding.
+## 5. Recommendations
+
+### 1. Fix the endometriosis match gap (highest priority)
+
+- The signal: 37% conversion vs 62-70% for everyone else. Gap is at Intake → Match.
+- Most likely cause: not enough endo specialists on the platform.
+- What to do:
+  - Recruit more endometriosis specialists (supply-side)
+  - In the meantime, build a "while you wait" engagement track for unmatched patients - educational content, peer support, symptom tracking. Anything to keep them around until a match opens up.
+- Rough opportunity sizing: if endo conversion gets to the platform median (~62%), that's an additional ~180 first visits per ~750 endo signups, a ~66% lift in that segment.
+
+### 2. Attack the month-0 to month-1 retention drop
+
+- The signal: only ~42% of converted patients return in month 1.
+- Cause: likely no automated re-engagement between visits.
+- What to do: post-visit follow-up sequence — provider message at day 7, symptom check-in at day 21, scheduling nudge at day 25. A/B test against no-touch.
+
+### 3. Better instrumentation on the match step
+
+- We can see THAT the match step is the bottleneck but not WHY (provider availability? insurance? geography?).
+- What to do: granular event tracking on the match flow specifically — match request created, providers offered, patient selected, appointment booked. Without this we're just guessing.
+
+---
+
+*Synthetic data, but the analytical patterns and SQL are what I use day-to-day on real claims and event data.*
